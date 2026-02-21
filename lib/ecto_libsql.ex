@@ -54,6 +54,11 @@ defmodule EctoLibSql do
   # Default busy timeout in milliseconds (5 seconds)
   @default_busy_timeout 5000
 
+  # ETS table for tracking savepoint names during nested transactions.
+  # The Ecto SQL Sandbox uses mode: :savepoint for nested transaction support.
+  # Keys are LibSQL trx_id strings; values are savepoint name strings.
+  @savepoint_table :ecto_libsql_savepoints
+
   @impl true
   @doc """
   Opens a connection to LibSQL using the native Rust layer.
@@ -308,11 +313,29 @@ defmodule EctoLibSql do
 
   The transaction behaviour (deferred/immediate/exclusive) can be controlled
   via options passed to the Native module.
+
+  When `mode: :savepoint` is given and a transaction is already active, a
+  SAVEPOINT is created instead of issuing a nested BEGIN (which SQLite does
+  not support). This is required by the Ecto SQL Sandbox.
   """
-  def handle_begin(_opts, state) do
-    case EctoLibSql.Native.begin(state) do
-      {:ok, new_state} -> {:ok, :begin, new_state}
-      {:error, reason} -> {:error, reason, state}
+  def handle_begin(opts, state) do
+    if Keyword.get(opts, :mode) == :savepoint and not is_nil(state.trx_id) do
+      sp_name = "ecto_sp_#{:erlang.unique_integer([:positive])}"
+
+      case EctoLibSql.Native.create_savepoint(state, sp_name) do
+        :ok ->
+          ensure_sp_table()
+          :ets.insert(@savepoint_table, {state.trx_id, sp_name})
+          {:ok, :savepoint, state}
+
+        {:error, reason} ->
+          {:error, %RuntimeError{message: "Savepoint creation failed: #{inspect(reason)}"}, state}
+      end
+    else
+      case EctoLibSql.Native.begin(state) do
+        {:ok, new_state} -> {:ok, :begin, new_state}
+        {:error, reason} -> {:error, reason, state}
+      end
     end
   end
 
@@ -327,16 +350,34 @@ defmodule EctoLibSql do
 
   The state must contain a valid transaction ID. For embedded replicas with
   auto-sync enabled, this will also trigger a sync to the remote database.
+
+  If a SAVEPOINT is tracked for the current transaction (e.g. created by the
+  Ecto SQL Sandbox via `handle_begin/2` with `mode: :savepoint`), it is
+  released instead of committing the outer transaction. Otherwise the outer
+  transaction is committed normally.
   """
   def handle_commit(_opts, state) do
-    case EctoLibSql.Native.commit(
-           %EctoLibSql.State{conn_id: conn_id, trx_id: _trx_id, mode: mode} = state
-         ) do
-      {:ok, _} ->
-        {:ok, %EctoLibSql.Result{}, %EctoLibSql.State{conn_id: conn_id, mode: mode}}
+    case pop_savepoint(state.trx_id) do
+      nil ->
+        case EctoLibSql.Native.commit(
+               %EctoLibSql.State{conn_id: conn_id, trx_id: _trx_id, mode: mode} = state
+             ) do
+          {:ok, _} ->
+            {:ok, %EctoLibSql.Result{}, %EctoLibSql.State{conn_id: conn_id, mode: mode}}
 
-      {:error, reason} ->
-        {:disconnect, reason, state}
+          {:error, reason} ->
+            {:disconnect, reason, state}
+        end
+
+      sp_name ->
+        case EctoLibSql.Native.release_savepoint_by_name(state, sp_name) do
+          :ok ->
+            {:ok, %EctoLibSql.Result{}, state}
+
+          {:error, reason} ->
+            {:disconnect, %RuntimeError{message: "Release savepoint failed: #{inspect(reason)}"},
+             state}
+        end
     end
   end
 
@@ -346,16 +387,66 @@ defmodule EctoLibSql do
 
   Discards all changes made within the transaction and returns the connection
   to autocommit mode.
-  """
-  def handle_rollback(_opts, %EctoLibSql.State{conn_id: conn_id, trx_id: _trx_id} = state) do
-    case EctoLibSql.Native.rollback(state) do
-      {:ok, _} ->
-        {:ok, %EctoLibSql.Result{}, %EctoLibSql.State{conn_id: conn_id, trx_id: nil}}
 
-      {:error, reason} ->
-        {:disconnect, reason, state}
+  If a SAVEPOINT is tracked for the current transaction (e.g. created by the
+  Ecto SQL Sandbox via `handle_begin/2` with `mode: :savepoint`), the rollback
+  targets that savepoint instead of the outer transaction. Otherwise the outer
+  transaction is rolled back normally.
+  """
+  def handle_rollback(_opts, state) do
+    case pop_savepoint(state.trx_id) do
+      nil ->
+        %EctoLibSql.State{conn_id: conn_id} = state
+
+        case EctoLibSql.Native.rollback(state) do
+          {:ok, _} ->
+            {:ok, %EctoLibSql.Result{}, %EctoLibSql.State{conn_id: conn_id, trx_id: nil}}
+
+          {:error, reason} ->
+            {:disconnect, reason, state}
+        end
+
+      sp_name ->
+        case EctoLibSql.Native.rollback_to_savepoint_by_name(state, sp_name) do
+          :ok ->
+            EctoLibSql.Native.release_savepoint_by_name(state, sp_name)
+            {:ok, %EctoLibSql.Result{}, state}
+
+          {:error, reason} ->
+            {:disconnect,
+             %RuntimeError{message: "Rollback to savepoint failed: #{inspect(reason)}"}, state}
+        end
     end
   end
+
+  defp ensure_sp_table do
+    case :ets.whereis(@savepoint_table) do
+      :undefined ->
+        try do
+          :ets.new(@savepoint_table, [:set, :public, :named_table])
+        rescue
+          ArgumentError -> @savepoint_table
+        end
+
+      _ ->
+        @savepoint_table
+    end
+  end
+
+  defp pop_savepoint(trx_id) when is_binary(trx_id) do
+    ensure_sp_table()
+
+    case :ets.lookup(@savepoint_table, trx_id) do
+      [{^trx_id, sp_name}] ->
+        :ets.delete(@savepoint_table, trx_id)
+        sp_name
+
+      [] ->
+        nil
+    end
+  end
+
+  defp pop_savepoint(_), do: nil
 
   @impl true
   @doc """
