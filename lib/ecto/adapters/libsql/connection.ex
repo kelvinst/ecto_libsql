@@ -1326,7 +1326,7 @@ defmodule Ecto.Adapters.LibSql.Connection do
       ",",
       expr(datetime, sources, query),
       ",",
-      interval_modifier(count, interval, sources, query),
+      interval(count, interval, sources),
       ") AS TEXT)"
     ]
   end
@@ -1339,7 +1339,7 @@ defmodule Ecto.Adapters.LibSql.Connection do
       ",",
       expr(date, sources, query),
       ",",
-      interval_modifier(count, interval, sources, query),
+      interval(count, interval, sources),
       ") AS TEXT)"
     ]
   end
@@ -1489,21 +1489,21 @@ defmodule Ecto.Adapters.LibSql.Connection do
     expr(value, sources, query)
   end
 
-  # Build a SQLite datetime modifier from a count and interval.
-  # Literal counts produce an inline modifier string: '-2 second'
-  # Bound parameters use CAST concatenation: (CAST(? AS TEXT) || ' second')
-  defp interval_modifier(%Ecto.Query.Tagged{value: value}, interval, _sources, _query)
-       when is_number(value) do
-    [?', to_string(value), " ", interval, ?']
+  def interval(_, "microsecond", _sources) do
+    raise ArgumentError,
+          "SQLite does not support microsecond precision in datetime intervals"
   end
 
-  defp interval_modifier(count, interval, _sources, _query)
-       when is_integer(count) or is_float(count) do
-    [?', to_string(count), " ", interval, ?']
+  def interval(count, "millisecond", sources) do
+    "(#{expr(count, sources, nil)} / 1000.0) || ' seconds'"
   end
 
-  defp interval_modifier(count, interval, sources, query) do
-    ["(CAST(", expr(count, sources, query), " AS TEXT) || ' ", interval, "')"]
+  def interval(count, "week", sources) do
+    "(#{expr(count, sources, nil)} * 7) || ' days'"
+  end
+
+  def interval(count, interval, sources) do
+    "#{expr(count, sources, nil)} || ' #{interval}'"
   end
 
   defp intersperse_map(list, separator, mapper) do
