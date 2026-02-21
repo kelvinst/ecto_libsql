@@ -1306,6 +1306,44 @@ defmodule Ecto.Adapters.LibSql.Connection do
     ["max(", expr(arg, sources, query), ?)]
   end
 
+  # datetime_add - used by ago/2, from_now/2, and datetime_add/3
+  # Uses strftime with ISO8601 T-separator to match how Elixir encodes datetimes for storage.
+  # SQLite's plain datetime() outputs "YYYY-MM-DD HH:MM:SS" (space), but stored values use
+  # "YYYY-MM-DDTHH:MM:SS" (T), causing incorrect string comparisons. strftime produces T-format.
+  defp expr({:datetime_add, _, [datetime, count, interval]}, sources, query) do
+    format =
+      case Application.get_env(:ecto_sqlite3, :datetime_type) do
+        :text_datetime ->
+          "%Y-%m-%d %H:%M:%f000Z"
+
+        _ ->
+          nil
+      end
+
+    [
+      "CAST (",
+      "strftime('%Y-%m-%dT%H:%M:%f000Z'",
+      ",",
+      expr(datetime, sources, query),
+      ",",
+      interval_modifier(count, interval, sources, query),
+      ") AS TEXT)"
+    ]
+  end
+
+  # date_add - used by date_add/3
+  defp expr({:date_add, _, [date, count, interval]}, sources, query) do
+    [
+      "CAST (",
+      "strftime('%Y-%m-%d'",
+      ",",
+      expr(date, sources, query),
+      ",",
+      interval_modifier(count, interval, sources, query),
+      ") AS TEXT)"
+    ]
+  end
+
   # Fragment for raw SQL
   defp expr({:fragment, _, parts}, sources, query) do
     Enum.map(parts, fn
@@ -1449,6 +1487,23 @@ defmodule Ecto.Adapters.LibSql.Connection do
   defp returning_expr(value, sources, query) do
     # For other expressions, fall back to the normal expr function.
     expr(value, sources, query)
+  end
+
+  # Build a SQLite datetime modifier from a count and interval.
+  # Literal counts produce an inline modifier string: '-2 second'
+  # Bound parameters use CAST concatenation: (CAST(? AS TEXT) || ' second')
+  defp interval_modifier(%Ecto.Query.Tagged{value: value}, interval, _sources, _query)
+       when is_number(value) do
+    [?', to_string(value), " ", interval, ?']
+  end
+
+  defp interval_modifier(count, interval, _sources, _query)
+       when is_integer(count) or is_float(count) do
+    [?', to_string(count), " ", interval, ?']
+  end
+
+  defp interval_modifier(count, interval, sources, query) do
+    ["(CAST(", expr(count, sources, query), " AS TEXT) || ' ", interval, "')"]
   end
 
   defp intersperse_map(list, separator, mapper) do

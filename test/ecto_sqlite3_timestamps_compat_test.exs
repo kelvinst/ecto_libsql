@@ -210,7 +210,6 @@ defmodule EctoLibSql.EctoSqlite3TimestampsCompatTest do
              |> TestRepo.all()
   end
 
-  @tag :sqlite_limitation
   test "using built in ecto functions with datetime" do
     account = insert_account(%{name: "Test"})
 
