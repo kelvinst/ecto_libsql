@@ -1311,15 +1311,6 @@ defmodule Ecto.Adapters.LibSql.Connection do
   # SQLite's plain datetime() outputs "YYYY-MM-DD HH:MM:SS" (space), but stored values use
   # "YYYY-MM-DDTHH:MM:SS" (T), causing incorrect string comparisons. strftime produces T-format.
   defp expr({:datetime_add, _, [datetime, count, interval]}, sources, query) do
-    format =
-      case Application.get_env(:ecto_sqlite3, :datetime_type) do
-        :text_datetime ->
-          "%Y-%m-%d %H:%M:%f000Z"
-
-        _ ->
-          nil
-      end
-
     [
       "CAST (",
       "strftime('%Y-%m-%dT%H:%M:%f000Z'",
