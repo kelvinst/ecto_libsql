@@ -1306,33 +1306,22 @@ defmodule Ecto.Adapters.LibSql.Connection do
     ["max(", expr(arg, sources, query), ?)]
   end
 
-  # datetime_add - used by ago/2, from_now/2, and datetime_add/3
-  # Uses strftime with ISO8601 T-separator to match how Elixir encodes datetimes for storage.
-  # SQLite's plain datetime() outputs "YYYY-MM-DD HH:MM:SS" (space), but stored values use
-  # "YYYY-MM-DDTHH:MM:SS" (T), causing incorrect string comparisons. strftime produces T-format.
-  defp expr({:datetime_add, _, [datetime, count, interval]}, sources, query) do
-    [
-      "CAST (",
-      "strftime('%Y-%m-%dT%H:%M:%f000Z'",
-      ",",
-      expr(datetime, sources, query),
-      ",",
-      interval(count, interval, sources),
-      ") AS TEXT)"
-    ]
+  # datetime_add / date_add are not supported.
+  # SQLite stores datetimes as TEXT in ISO8601 format ("YYYY-MM-DDTHH:MM:SSZ"), and its
+  # datetime arithmetic functions (datetime(), strftime()) require values in a format that
+  # differs from what Ecto stores, making results silently incorrect.
+  # Use Elixir-side arithmetic (DateTime.add/3, Date.add/2) and pass the computed value
+  # as a parameter instead.
+  defp expr({:datetime_add, _, [_datetime, _count, _interval]}, _sources, _query) do
+    raise ArgumentError,
+          "LibSQL/SQLite does not support datetime_add (used by ago/2 and from_now/2). " <>
+            "Compute the datetime in Elixir with DateTime.add/3 and pass it as a parameter."
   end
 
-  # date_add - used by date_add/3
-  defp expr({:date_add, _, [date, count, interval]}, sources, query) do
-    [
-      "CAST (",
-      "strftime('%Y-%m-%d'",
-      ",",
-      expr(date, sources, query),
-      ",",
-      interval(count, interval, sources),
-      ") AS TEXT)"
-    ]
+  defp expr({:date_add, _, [_date, _count, _interval]}, _sources, _query) do
+    raise ArgumentError,
+          "LibSQL/SQLite does not support date_add. " <>
+            "Compute the date in Elixir with Date.add/2 and pass it as a parameter."
   end
 
   # Fragment for raw SQL
